@@ -1,0 +1,130 @@
+name: Create branch on issue assigned
+
+on:
+  workflow_call:
+    secrets:
+      token:
+        required: true
+
+jobs:
+  create-branch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - name: Get issue data
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.token }}
+          script: |
+            const issue = context.payload.issue;
+
+            const labelMap = {
+              'feature':       'feat',
+              'enhancement':   'enhance',
+              'fix':           'fix',
+              'refactor':      'refactor',
+              'chore':         'chore',
+              'test':          'test',
+              'task':          'task',
+              'documentation': 'docs',
+            };
+
+            const label = issue.labels.map(l => l.name).find(n => labelMap[n]);
+            if (!label) {
+              core.info(`No valid label found on issue #${issue.number}. Skipping.`);
+              core.setOutput('skip', 'true');
+              return;
+            }
+
+            const prefix = labelMap[label];
+
+            const slug = issue.title
+              .normalize('NFD')
+              .replace(/[\u0300-\u036f]/g, '')
+              .toLowerCase()
+              .replace(/[^a-z0-9\s-]/g, '')
+              .replace(/[\s]+/g, '-')
+              .replace(/-+/g, '-')
+              .replace(/^-+|-+$/g, '')
+              .slice(0, 50)
+              .replace(/^-+|-+$/g, '');
+
+            const branchName = `${prefix}/${issue.number}-${slug}`;
+
+            let baseBranch = 'develop';
+            const body = issue.body || '';
+            const parentMatch = body.match(/^Parent:\s*#(\d+)/mi);
+
+            if (parentMatch) {
+              const parentNumber = parentMatch[1];
+
+              const branches = await github.paginate(github.rest.repos.listBranches, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              });
+
+              const parentBranch = branches.find(b =>
+                new RegExp(`^[^/]+/${parentNumber}-`).test(b.name)
+              );
+
+              if (!parentBranch) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: `⚠️ **No se pudo crear la rama automáticamente.**\n\nEl issue padre #${parentNumber} aún no tiene una rama asociada.\n\nCrea primero la rama del issue padre asignándote el issue #${parentNumber} y luego vuelve a asignarte este issue.`,
+                });
+                core.setFailed(`Parent branch for issue #${parentNumber} not found.`);
+                return;
+              }
+
+              baseBranch = parentBranch.name;
+            }
+
+            core.setOutput('skip', 'false');
+            core.setOutput('branch_name', branchName);
+            core.setOutput('base_branch', baseBranch);
+
+      - name: Create branch
+        if: steps.issue.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        env:
+          BRANCH_NAME: ${{ steps.issue.outputs.branch_name }}
+          BASE_BRANCH: ${{ steps.issue.outputs.base_branch }}
+        with:
+          github-token: ${{ secrets.token }}
+          script: |
+            const branchName = process.env.BRANCH_NAME;
+            const baseBranch = process.env.BASE_BRANCH;
+
+            try {
+              await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `heads/${branchName}`,
+              });
+              core.info(`Branch "${branchName}" already exists. Skipping.`);
+              return;
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+
+            const { data: baseRef } = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `heads/${baseBranch}`,
+            });
+
+            await github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `refs/heads/${branchName}`,
+              sha: baseRef.object.sha,
+            });
+
+            core.info(`Branch "${branchName}" created from "${baseBranch}".`);
